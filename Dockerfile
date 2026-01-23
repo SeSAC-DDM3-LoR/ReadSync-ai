@@ -3,9 +3,9 @@ FROM python:3.13-slim
 
 # 2. Poetry 설치 및 환경 설정
 # virtualenvs.create false: 컨테이너 자체가 격리 환경이므로 가상환경을 따로 만들지 않습니다.
-ENV POETRY_VERSION=1.7.1 \
-    POETRY_VIRTUALENVS_CREATE=false \
-    POETRY_NO_INTERACTION=1
+ENV POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1 \
+    PYTHONPATH=/app/src
 
 # 3. 필수 도구 설치
 RUN apt-get update && apt-get install -y \

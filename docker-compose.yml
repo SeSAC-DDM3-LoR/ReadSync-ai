@@ -1,0 +1,8 @@
+services:
+  ai-server:
+    build: .
+    container_name: readsync-ai-container
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONPATH=/app/src

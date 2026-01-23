@@ -3,11 +3,15 @@
 # =================================================================
 .git
 .gitignore
+.github/
 .dockerignore
 .idea
 .vscode
 .history
 *.iml
+Dockerfile
+docker-compose.yml
+docker-compose-*.yml
 
 # =================================================================
 # 2. Python & Dependencies (컨테이너 내부에서 새로 설치함)
@@ -18,6 +22,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.pytest_cache/
 # Poetry가 생성하는 가상환경 제외
 .python-version
 
@@ -45,7 +50,6 @@ runs/
 # =================================================================
 .env
 .env.*
-! .env.example  # 예시 파일만은 포함하고 싶을 때 사용 (선택 사항)
 
 .DS_Store
 Thumbs.db
@@ -57,3 +61,7 @@ desktop.ini
 db/
 redis/
 postgres_data/
+
+# 6. 문서 및 기타
+README.md
+LICENSE
