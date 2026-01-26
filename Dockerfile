@@ -30,8 +30,8 @@ RUN poetry install --no-root --without dev
 # 7. 전체 소스 코드 복사
 COPY . .
 
-# 8. 포트 개방 (8001번 사용하신다고 하셨으니)
-EXPOSE 8001
+# 8. 포트 개방 (8000번 사용하신다고 하셨으니)
+EXPOSE 8000
 
 # 9. 실행 명령어
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
