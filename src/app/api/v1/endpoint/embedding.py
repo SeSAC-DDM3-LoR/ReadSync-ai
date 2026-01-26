@@ -257,3 +257,128 @@ async def get_text_from_drive(request: DriveEmbeddingRequest) -> List[str]:
     ]
 
     return texts
+
+class RagEmbeddingRequest(BaseModel):
+    content: List[dict] # 책의 content 구조 (text, id 포함)
+
+class ChunkEmbedding(BaseModel):
+    content_chunk: str
+    chunk_index: int
+    vector: List[float]
+    paragraph_ids: List[str]
+
+class EmbeddingRagResponse(BaseModel):
+    embeddings: List[ChunkEmbedding]
+
+@router.post("/embed-rag-content", response_model=EmbeddingRagResponse)
+async def embed_rag_content(request: RagEmbeddingRequest):
+    try:
+        # 1. 텍스트 추출 및 구조화
+        # node['text']가 있는 것만 추출하면서, 해당 node의 id도 함께 보관
+        content_nodes = [
+            {'text': node['text'], 'id': node.get('id')}
+            for node in request.content
+            if 'text' in node and node['text'].strip()
+        ]
+
+        if not content_nodes:
+            raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
+
+        chunk_embeddings = []
+        
+        current_chunk_text = ""
+        current_chunk_ids = []
+        
+        # 청킹 설정
+        MIN_CHUNK_SIZE = 2000
+        OVERLAP_RATIO = 0.2
+        
+        # 마지막으로 처리된 노드 인덱스 (오버랩 계산용)
+        last_processed_index = 0
+        i = 0
+        
+        while i < len(content_nodes):
+            node = content_nodes[i]
+            text = node['text']
+            node_id = node['id']
+            
+            # 현재 청크에 추가
+            current_chunk_text += (text + " ")
+            if node_id:
+                current_chunk_ids.append(node_id)
+            
+            # 최소 길이 도달 체크
+            if len(current_chunk_text) >= MIN_CHUNK_SIZE:
+                # 1. 임베딩 수행
+                vector = await client.feature_extraction(current_chunk_text.strip())
+                
+                # 2. 결과 저장
+                chunk_embeddings.append(ChunkEmbedding(
+                    content_chunk=current_chunk_text.strip(),
+                    chunk_index=len(chunk_embeddings),
+                    vector=vector.tolist() if hasattr(vector, "tolist") else vector,
+                    paragraph_ids=current_chunk_ids
+                ))
+                
+                # 3. 오버랩 처리
+                # 현재 청크의 약 20% 길이에 해당하는 뒷부분 문단들을 찾아서 다음 청크의 시작으로 설정
+                target_overlap_len = len(current_chunk_text) * OVERLAP_RATIO
+                overlap_text_len = 0
+                overlap_start_index = i # 현재 인덱스에서 역으로 탐색
+                
+                # 역방향으로 20% 길이만큼 거슬러 올라감
+                temp_overlap_nodes = []
+                
+                # 현재 청크에 포함된 마지막 노드(i)부터 역순으로
+                # 단, 이번 청크의 시작점(last_processed_index)보다는 뒤여야 무한루프 안 돔
+                backtrack_idx = i
+                while backtrack_idx > last_processed_index:
+                    node_len = len(content_nodes[backtrack_idx]['text']) + 1 # 공백 포함
+                    if overlap_text_len + node_len > target_overlap_len:
+                        break # 오버랩 충분함
+                    
+                    overlap_text_len += node_len
+                    backtrack_idx -= 1
+                
+                # 다음 루프 시작점 설정 (오버랩 구간의 시작점 + 1 ... 이 아니고, 오버랩 구간의 시작점부터 다시 시작해야 함)
+                # backtrack_idx는 오버랩에 포함되지 *않은* 마지막 노드임. 따라서 그 다다음부터가 아니라, backtrack_idx + 1부터 시작.
+                
+                # 만약 i가 끝까지 갔다면 종료
+                if i == len(content_nodes) - 1:
+                    break
+                    
+                # 다음 시작 인덱스 갱신
+                i = backtrack_idx + 1
+                last_processed_index = i # 다음 청크의 시작점 기록
+                
+                # 상태 초기화
+                current_chunk_text = ""
+                current_chunk_ids = []
+                
+                # while 루프의 i 증가를 막기 위해 continue 하거나, 여기서 i를 조정했으니 루프가 그대로 진행되도록 둠.
+                # 단, 바깥쪽 루프가 i += 1 하는 구조가 아니라 while i < len 이므로, 내부에서 i를 제어해야 함.
+                # 지금 로직은 i를 하나씩 증가시키는 구조가 아님.
+                # 따라서 로직을 약간 수정: for 문 대신 수동 인덱스 관리.
+                
+                continue 
+
+            i += 1
+            
+        # 남은 짜투리 처리
+        if current_chunk_text.strip():
+             # 만약 이전에 처리된 내용과 너무 중복되거나 짧으면 스킵할 수도 있으나, 
+             # 여기서는 남은건 다 저장.
+             vector = await client.feature_extraction(current_chunk_text.strip())
+             chunk_embeddings.append(ChunkEmbedding(
+                content_chunk=current_chunk_text.strip(),
+                chunk_index=len(chunk_embeddings),
+                vector=vector.tolist() if hasattr(vector, "tolist") else vector,
+                paragraph_ids=current_chunk_ids
+             ))
+
+        print(f"✅ RAG 청킹 완료: 총 {len(chunk_embeddings)}개 청크 생성")
+        return EmbeddingRagResponse(embeddings=chunk_embeddings)
+
+    except Exception as e:
+        print(f"❌ RAG 임베딩 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
