@@ -257,3 +257,160 @@ async def get_text_from_drive(request: DriveEmbeddingRequest) -> List[str]:
     ]
 
     return texts
+
+
+
+class RagNode(BaseModel):
+    text: str
+    id: str | int | None  # id can be int or string, normalize to string later
+    speaker: str | None = None
+
+class RagEmbeddingRequest(BaseModel):
+    content: List[RagNode]
+
+class ChildChunk(BaseModel):
+    content_text: str  # Renamed
+    vector: List[float]
+    chunk_index: int   # Added
+    paragraph_ids: List[str] # Changed to list of strings
+
+class ParentChunk(BaseModel):
+    content_text: str # Renamed
+    speaker_list: List[str]
+    paragraph_ids: List[str] # Added
+    start_paragraph_id: str # Changed to str
+    end_paragraph_id: str   # Changed to str
+    children: List[ChildChunk]
+
+class EmbeddingRagResponse(BaseModel):
+    parents: List[ParentChunk]
+
+class EmbeddingQueryRequest(BaseModel):
+    text: str
+
+@router.post("/embed-query", response_model=EmbeddingResponse)
+async def embed_query(request: EmbeddingQueryRequest):
+    try:
+        if not request.text.strip():
+            raise HTTPException(status_code=400, detail="Query text cannot be empty.")
+
+        # 단일 텍스트 임베딩
+        vector = await client.feature_extraction(request.text.strip())
+        
+        # 안전한 타입 변환
+        result_list = vector.tolist() if hasattr(vector, "tolist") else vector
+        return {"embedding": result_list}
+
+    except Exception as e:
+        print(f"❌ Query 임베딩 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/embed-rag-content", response_model=EmbeddingRagResponse)
+async def embed_rag_content(request: RagEmbeddingRequest):
+    try:
+        # 1. 텍스트 추출 및 구조화 (Pydantic 모델 사용)
+        content_nodes = request.content
+        if not content_nodes:
+            raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
+
+        parents = []
+        
+        # Parent Chunking 설정
+        PARENT_CHUNK_SIZE = 20  # 문단 수 기준
+        PARENT_OVERLAP = 5      # 20% 오버랩
+        
+        # Child Chunking 설정
+        CHILD_CHUNK_SIZE = 5    # 5문단
+        CHILD_OVERLAP = 1       # 1문단 오버랩
+
+        # 전체 노드 순회
+        parent_start_idx = 0
+        
+        while parent_start_idx < len(content_nodes):
+            # 2-1. Parent Chunk 범위 설정
+            parent_end_idx = min(parent_start_idx + PARENT_CHUNK_SIZE, len(content_nodes))
+            
+            # Parent Chunk 생성
+            parent_nodes = content_nodes[parent_start_idx:parent_end_idx]
+            
+            # Parent 메타데이터 추출
+            parent_text_builder = []
+            parent_speakers = set()
+            parent_para_ids = [] # Added for ID collection
+            start_para_id = str(parent_nodes[0].id) if parent_nodes[0].id is not None else "0"
+            end_para_id = str(parent_nodes[-1].id) if parent_nodes[-1].id is not None else "0"
+            
+            for node in parent_nodes:
+                text_part = node.text
+                if node.speaker:
+                    text_part = f"{node.speaker}: {text_part}"
+                    parent_speakers.add(node.speaker)
+                parent_text_builder.append(text_part)
+                parent_para_ids.append(str(node.id) if node.id is not None else "0") # Collect IDs
+            
+            parent_content = " ".join(parent_text_builder)
+            
+            # 2-2. Child Chunking (Parent 내부에서 수행)
+            children = []
+            child_start_idx = 0 # Parent 내부 인덱스
+            
+            while child_start_idx < len(parent_nodes):
+                child_end_idx = min(child_start_idx + CHILD_CHUNK_SIZE, len(parent_nodes))
+                child_nodes = parent_nodes[child_start_idx:child_end_idx]
+                
+                # Child 메타데이터
+                child_text_builder = []
+                child_para_ids = []
+
+                for node in child_nodes:
+                    text_part = node.text
+                    if node.speaker:
+                        text_part = f"{node.speaker}: {text_part}"
+                    child_text_builder.append(text_part)
+                    child_para_ids.append(str(node.id) if node.id is not None else "0")
+                
+                child_content = " ".join(child_text_builder)
+                
+                # Child Vector 생성 (비동기 처리)
+                if child_content.strip():
+                     vector = await client.feature_extraction(child_content.strip())
+                     
+                     children.append(ChildChunk(
+                         content_text=child_content,
+                         vector=vector.tolist() if hasattr(vector, "tolist") else vector,
+                         chunk_index=len(children), # 현재 Parent 내에서의 순서 (0부터 시작)
+                         paragraph_ids=child_para_ids
+                     ))
+                
+                # Child Loop Control
+                if child_end_idx == len(parent_nodes):
+                    break
+                
+                # 인덱스 증가
+                child_start_idx += (CHILD_CHUNK_SIZE - CHILD_OVERLAP)
+            
+            # Parent 결과 저장
+            parents.append(ParentChunk(
+                content_text=parent_content,
+                speaker_list=list(parent_speakers),
+                paragraph_ids=parent_para_ids, # Added
+                start_paragraph_id=start_para_id,
+                end_paragraph_id=end_para_id,
+                children=children
+            ))
+
+            # Parent Loop Control
+            if parent_end_idx == len(content_nodes):
+                break
+                
+            parent_start_idx += (PARENT_CHUNK_SIZE - PARENT_OVERLAP)
+
+        print(f"✅ RAG Parent 청킹 완료: 총 {len(parents)}개 Parent 청크 생성")
+        return EmbeddingRagResponse(parents=parents)
+
+    except Exception as e:
+        print(f"❌ RAG 임베딩 처리 실패: {e}")
+        # traceback 출력으로 디버깅 용이하게
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
