@@ -99,5 +99,3 @@ db/
 redis/
 postgres_data/
 docker-compose-*.yml
-poetry.lock
-pyproject.toml
