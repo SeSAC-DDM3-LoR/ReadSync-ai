@@ -281,126 +281,160 @@ async def get_embedding_from_text(request: TextEmbeddingRequest):
 class RagEmbeddingRequest(BaseModel):
     content: List[dict] # 책의 content 구조 (text, id 포함)
 
-class ChunkEmbedding(BaseModel):
-    content_chunk: str
-    chunk_index: int
+
+class RagNode(BaseModel):
+    text: str
+    id: str | int | None  # id can be int or string, normalize to string later
+    speaker: str | None = None
+
+class RagEmbeddingRequest(BaseModel):
+    content: List[RagNode]
+
+class ChildChunk(BaseModel):
+    content_text: str  # Renamed
     vector: List[float]
-    paragraph_ids: List[str]
+    chunk_index: int   # Added
+    paragraph_ids: List[str] # Changed to list of strings
+
+class ParentChunk(BaseModel):
+    content_text: str # Renamed
+    speaker_list: List[str]
+    paragraph_ids: List[str] # Added
+    start_paragraph_id: str # Changed to str
+    end_paragraph_id: str   # Changed to str
+    children: List[ChildChunk]
 
 class EmbeddingRagResponse(BaseModel):
-    embeddings: List[ChunkEmbedding]
+    parents: List[ParentChunk]
+
+class EmbeddingQueryRequest(BaseModel):
+    text: str
+
+@router.post("/embed-query", response_model=EmbeddingResponse)
+async def embed_query(request: EmbeddingQueryRequest):
+    try:
+        if not request.text.strip():
+            raise HTTPException(status_code=400, detail="Query text cannot be empty.")
+
+        # 단일 텍스트 임베딩
+        vector = await client.feature_extraction(request.text.strip())
+        
+        # 안전한 타입 변환
+        result_list = vector.tolist() if hasattr(vector, "tolist") else vector
+        return {"embedding": result_list}
+
+    except Exception as e:
+        print(f"❌ Query 임베딩 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/embed-rag-content", response_model=EmbeddingRagResponse)
 async def embed_rag_content(request: RagEmbeddingRequest):
     try:
-        # 1. 텍스트 추출 및 구조화
-        # node['text']가 있는 것만 추출하면서, 해당 node의 id도 함께 보관
-        content_nodes = [
-            {'text': node['text'], 'id': node.get('id')}
-            for node in request.content
-            if 'text' in node and node['text'].strip()
-        ]
-
+        # 1. 텍스트 추출 및 구조화 (Pydantic 모델 사용)
+        content_nodes = request.content
         if not content_nodes:
             raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
 
-        chunk_embeddings = []
+        parents = []
         
-        current_chunk_text = ""
-        current_chunk_ids = []
+        # Parent Chunking 설정
+        PARENT_CHUNK_SIZE = 20  # 문단 수 기준
+        PARENT_OVERLAP = 5      # 20% 오버랩
         
-        # 청킹 설정
-        MIN_CHUNK_SIZE = 2000
-        OVERLAP_RATIO = 0.2
+        # Child Chunking 설정
+        CHILD_CHUNK_SIZE = 5    # 5문단
+        CHILD_OVERLAP = 1       # 1문단 오버랩
+
+        # 전체 노드 순회
+        parent_start_idx = 0
         
-        # 마지막으로 처리된 노드 인덱스 (오버랩 계산용)
-        last_processed_index = 0
-        i = 0
-        
-        while i < len(content_nodes):
-            node = content_nodes[i]
-            text = node['text']
-            node_id = node['id']
+        while parent_start_idx < len(content_nodes):
+            # 2-1. Parent Chunk 범위 설정
+            parent_end_idx = min(parent_start_idx + PARENT_CHUNK_SIZE, len(content_nodes))
             
-            # 현재 청크에 추가
-            current_chunk_text += (text + " ")
-            if node_id:
-                current_chunk_ids.append(node_id)
+            # Parent Chunk 생성
+            parent_nodes = content_nodes[parent_start_idx:parent_end_idx]
             
-            # 최소 길이 도달 체크
-            if len(current_chunk_text) >= MIN_CHUNK_SIZE:
-                # 1. 임베딩 수행
-                vector = await client.feature_extraction(current_chunk_text.strip())
+            # Parent 메타데이터 추출
+            parent_text_builder = []
+            parent_speakers = set()
+            parent_para_ids = [] # Added for ID collection
+            start_para_id = str(parent_nodes[0].id) if parent_nodes[0].id is not None else "0"
+            end_para_id = str(parent_nodes[-1].id) if parent_nodes[-1].id is not None else "0"
+            
+            for node in parent_nodes:
+                text_part = node.text
+                if node.speaker:
+                    text_part = f"{node.speaker}: {text_part}"
+                    parent_speakers.add(node.speaker)
+                parent_text_builder.append(text_part)
+                parent_para_ids.append(str(node.id) if node.id is not None else "0") # Collect IDs
+            
+            parent_content = " ".join(parent_text_builder)
+            
+            # 2-2. Child Chunking (Parent 내부에서 수행)
+            children = []
+            child_start_idx = 0 # Parent 내부 인덱스
+            
+            while child_start_idx < len(parent_nodes):
+                child_end_idx = min(child_start_idx + CHILD_CHUNK_SIZE, len(parent_nodes))
+                child_nodes = parent_nodes[child_start_idx:child_end_idx]
                 
-                # 2. 결과 저장
-                chunk_embeddings.append(ChunkEmbedding(
-                    content_chunk=current_chunk_text.strip(),
-                    chunk_index=len(chunk_embeddings),
-                    vector=vector.tolist() if hasattr(vector, "tolist") else vector,
-                    paragraph_ids=current_chunk_ids
-                ))
+                # Child 메타데이터
+                child_text_builder = []
+                child_para_ids = []
+
+                for node in child_nodes:
+                    text_part = node.text
+                    if node.speaker:
+                        text_part = f"{node.speaker}: {text_part}"
+                    child_text_builder.append(text_part)
+                    child_para_ids.append(str(node.id) if node.id is not None else "0")
                 
-                # 3. 오버랩 처리
-                # 현재 청크의 약 20% 길이에 해당하는 뒷부분 문단들을 찾아서 다음 청크의 시작으로 설정
-                target_overlap_len = len(current_chunk_text) * OVERLAP_RATIO
-                overlap_text_len = 0
-                overlap_start_index = i # 현재 인덱스에서 역으로 탐색
+                child_content = " ".join(child_text_builder)
                 
-                # 역방향으로 20% 길이만큼 거슬러 올라감
-                temp_overlap_nodes = []
+                # Child Vector 생성 (비동기 처리)
+                if child_content.strip():
+                     vector = await client.feature_extraction(child_content.strip())
+                     
+                     children.append(ChildChunk(
+                         content_text=child_content,
+                         vector=vector.tolist() if hasattr(vector, "tolist") else vector,
+                         chunk_index=len(children), # 현재 Parent 내에서의 순서 (0부터 시작)
+                         paragraph_ids=child_para_ids
+                     ))
                 
-                # 현재 청크에 포함된 마지막 노드(i)부터 역순으로
-                # 단, 이번 청크의 시작점(last_processed_index)보다는 뒤여야 무한루프 안 돔
-                backtrack_idx = i
-                while backtrack_idx > last_processed_index:
-                    node_len = len(content_nodes[backtrack_idx]['text']) + 1 # 공백 포함
-                    if overlap_text_len + node_len > target_overlap_len:
-                        break # 오버랩 충분함
-                    
-                    overlap_text_len += node_len
-                    backtrack_idx -= 1
-                
-                # 다음 루프 시작점 설정 (오버랩 구간의 시작점 + 1 ... 이 아니고, 오버랩 구간의 시작점부터 다시 시작해야 함)
-                # backtrack_idx는 오버랩에 포함되지 *않은* 마지막 노드임. 따라서 그 다다음부터가 아니라, backtrack_idx + 1부터 시작.
-                
-                # 만약 i가 끝까지 갔다면 종료
-                if i == len(content_nodes) - 1:
+                # Child Loop Control
+                if child_end_idx == len(parent_nodes):
                     break
-                    
-                # 다음 시작 인덱스 갱신
-                i = backtrack_idx + 1
-                last_processed_index = i # 다음 청크의 시작점 기록
                 
-                # 상태 초기화
-                current_chunk_text = ""
-                current_chunk_ids = []
-                
-                # while 루프의 i 증가를 막기 위해 continue 하거나, 여기서 i를 조정했으니 루프가 그대로 진행되도록 둠.
-                # 단, 바깥쪽 루프가 i += 1 하는 구조가 아니라 while i < len 이므로, 내부에서 i를 제어해야 함.
-                # 지금 로직은 i를 하나씩 증가시키는 구조가 아님.
-                # 따라서 로직을 약간 수정: for 문 대신 수동 인덱스 관리.
-                
-                continue 
-
-            i += 1
+                # 인덱스 증가
+                child_start_idx += (CHILD_CHUNK_SIZE - CHILD_OVERLAP)
             
-        # 남은 짜투리 처리
-        if current_chunk_text.strip():
-             # 만약 이전에 처리된 내용과 너무 중복되거나 짧으면 스킵할 수도 있으나, 
-             # 여기서는 남은건 다 저장.
-             vector = await client.feature_extraction(current_chunk_text.strip())
-             chunk_embeddings.append(ChunkEmbedding(
-                content_chunk=current_chunk_text.strip(),
-                chunk_index=len(chunk_embeddings),
-                vector=vector.tolist() if hasattr(vector, "tolist") else vector,
-                paragraph_ids=current_chunk_ids
-             ))
+            # Parent 결과 저장
+            parents.append(ParentChunk(
+                content_text=parent_content,
+                speaker_list=list(parent_speakers),
+                paragraph_ids=parent_para_ids, # Added
+                start_paragraph_id=start_para_id,
+                end_paragraph_id=end_para_id,
+                children=children
+            ))
 
-        print(f"✅ RAG 청킹 완료: 총 {len(chunk_embeddings)}개 청크 생성")
-        return EmbeddingRagResponse(embeddings=chunk_embeddings)
+            # Parent Loop Control
+            if parent_end_idx == len(content_nodes):
+                break
+                
+            parent_start_idx += (PARENT_CHUNK_SIZE - PARENT_OVERLAP)
+
+        print(f"✅ RAG Parent 청킹 완료: 총 {len(parents)}개 Parent 청크 생성")
+        return EmbeddingRagResponse(parents=parents)
 
     except Exception as e:
         print(f"❌ RAG 임베딩 처리 실패: {e}")
+        # traceback 출력으로 디버깅 용이하게
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
