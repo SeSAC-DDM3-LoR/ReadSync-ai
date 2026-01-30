@@ -128,7 +128,7 @@ async def generate_response(request: GenerateRequest):
     if request.chat_type == "DEFINITION":
         system_prompt += " Explain the term clearly and concisely based on standard dictionary definitions. If the term has a specific meaning in the book's context provided, prioritize that."
     elif request.chat_type == "CONTENT_QA":
-        system_prompt += " Answer the question based ONLY on the provided Context. If the answer is not in the Context, say '제공된 내용에서는 답을 찾을 수 없습니다.' Cite the source paragraph if possible."
+        system_prompt += " Answer the question based ONLY on the provided Context. If the answer is not in the Context, say '제공된 내용에서는 답을 찾을 수 없습니다.'"
     elif request.chat_type == "SUMMARY":
         system_prompt += " Summarize the provided text concisely."
     elif request.chat_type == "QUIZ":
@@ -185,7 +185,7 @@ async def generate_response_stream(request: GenerateRequest):
     if request.chat_type == "DEFINITION":
         system_prompt += " Explain the term clearly and concisely based on standard dictionary definitions. If the term has a specific meaning in the book's context provided, prioritize that."
     elif request.chat_type == "CONTENT_QA":
-        system_prompt += " Answer the question based ONLY on the provided Context. If the answer is not in the Context, say '제공된 내용에서는 답을 찾을 수 없습니다.' Cite the source paragraph if possible."
+        system_prompt += " Answer the question based ONLY on the provided Context. If the answer is not in the Context, say '제공된 내용에서는 답을 찾을 수 없습니다.'"
     elif request.chat_type == "SUMMARY":
         system_prompt += " Summarize the provided text concisely."
     elif request.chat_type == "QUIZ":
