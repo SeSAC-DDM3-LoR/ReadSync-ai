@@ -40,6 +40,30 @@ class GenerateResponse(BaseModel):
     response: str
     token_usage: Optional[int] = 0
 
+def format_chat_history(previous_messages: Optional[List[dict]], current_msg: str, rag_context: Optional[str] = None) -> str:
+    """
+    대화 내역과 현재 메시지를 하나의 문자열로 포맷팅합니다. (Responses API의 input용)
+    """
+    formatted_input = ""
+    
+    # 이전 대화 내역 추가
+    if previous_messages:
+        # 최근 10개 메시지만 사용 (백엔드에서 이미 처리되지만 안전장치)
+        recent_messages = previous_messages[-10:]
+        for msg in recent_messages:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            formatted_input += f"[{role}]: {content}\n\n"
+    
+    # RAG Context 추가
+    if rag_context:
+        formatted_input += f"[CONTEXT]\n{rag_context}\n\n"
+        
+    # 현재 사용자 메시지 추가
+    formatted_input += f"[USER]: {current_msg}"
+    
+    return formatted_input
+
 @router.post("/chat/classify", response_model=ClassifyResponse)
 async def classify_message(request: ClassifyRequest):
     """
@@ -66,17 +90,16 @@ async def classify_message(request: ClassifyRequest):
         user_content += f"\n(Context: User is reading this paragraph: '{request.current_paragraph_content[:100]}...')"
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini", # 가벼운 모델 사용
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0.3,
-            max_completion_tokens=20 
+        # Responses API 사용
+        response = client.responses.create(
+            model="gpt-5-nano-2025-08-07",
+            input=user_content,
+            instructions=system_prompt,
+            reasoning={"effort": "minimal"},
+            max_output_tokens=20
         )
         
-        chat_type = completion.choices[0].message.content.strip().upper()
+        chat_type = response.output_text.strip().upper()
         
         # 유효성 검사 (혹시 모를 환각 방지)
         valid_types = ["DEFINITION", "CONTENT_QA", "SUMMARY", "QUIZ", "CHIT_CHAT"]
@@ -113,28 +136,34 @@ async def generate_response(request: GenerateRequest):
     elif request.chat_type == "CHIT_CHAT":
         system_prompt += " Engage in a friendly, polite conversation. Do not make up facts about the book if you don't know."
 
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # 이전 대화 내역 추가 (백엔드에서 이미 필터링해서 보내지만, 안전장치로 유지)
-    if request.previous_messages:
-        messages.extend(request.previous_messages[-10:])
-        
-    # 현재 컨텍스트 및 질문 추가
-    user_content = request.user_msg
-    if request.rag_context:
-        user_content = f"Context:\n{request.rag_context}\n\nQuestion: {request.user_msg}"
-    
-    messages.append({"role": "user", "content": user_content})
+    # Input 문자열 구성
+    input_text = format_chat_history(request.previous_messages, request.user_msg, request.rag_context)
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini", # 비용 효율적인 모델 사용
-            messages=messages,
-            temperature=0.7
+        # Chat Type에 따른 모델 및 파라미터 설정
+        if request.chat_type in ["CONTENT_QA", "SUMMARY", "QUIZ"]:
+            # 추론이 필요한 작업: gpt-5-mini
+            model = "gpt-5-mini-2025-08-07"
+            reasoning_config = {"effort": "low"}
+            text_config = {"verbosity": "medium"}
+        else:
+            # 가벼운 작업: gpt-5-nano
+            model = "gpt-5-nano-2025-08-07"
+            reasoning_config = {"effort": "minimal"}
+            text_config = {"verbosity": "low"}
+
+        response = client.responses.create(
+            model=model,
+            input=input_text,
+            instructions=system_prompt,
+            reasoning=reasoning_config,
+            text=text_config
         )
         
-        response_text = completion.choices[0].message.content
-        token_usage = completion.usage.total_tokens if completion.usage else 0
+        response_text = response.output_text
+        # Responses API에서는 usage 정보가 다를 수 있음. 일단 0으로 처리하거나 response 객체 확인 필요.
+        # 문서 상으로는 token_usage에 대한 명시가 없으나, 보통 usage 필드가 있음.
+        token_usage = response.usage.total_tokens if response.usage else 0
         
         return GenerateResponse(response=response_text, token_usage=token_usage)
 
@@ -164,28 +193,39 @@ async def generate_response_stream(request: GenerateRequest):
     elif request.chat_type == "CHIT_CHAT":
         system_prompt += " Engage in a friendly, polite conversation. Do not make up facts about the book if you don't know."
 
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    if request.previous_messages:
-        messages.extend(request.previous_messages[-10:])
-        
-    user_content = request.user_msg
-    if request.rag_context:
-        user_content = f"Context:\n{request.rag_context}\n\nQuestion: {request.user_msg}"
-    
-    messages.append({"role": "user", "content": user_content})
+    # Input 문자열 구성
+    input_text = format_chat_history(request.previous_messages, request.user_msg, request.rag_context)
 
     async def event_generator():
         try:
-            stream = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                temperature=0.7,
+             # Chat Type에 따른 모델 및 파라미터 설정
+            if request.chat_type in ["CONTENT_QA", "SUMMARY", "QUIZ"]:
+                # 추론이 필요한 작업: gpt-5-mini
+                model = "gpt-5-mini-2025-08-07"
+                reasoning_config = {"effort": "low"}
+                text_config = {"verbosity": "medium"}
+            else:
+                # 가벼운 작업: gpt-5-nano
+                model = "gpt-5-nano-2025-08-07"
+                reasoning_config = {"effort": "minimal"}
+                text_config = {"verbosity": "low"}
+
+            stream = client.responses.create(
+                model=model,
+                input=input_text,
+                instructions=system_prompt,
+                reasoning=reasoning_config,
+                text=text_config,
                 stream=True
             )
-            for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+            
+            for event in stream:
+                # ResponseTextDeltaEvent 처리
+                if event.type == "response.output_text.delta":
+                    # event.delta 가 텍스트 조각임
+                    if event.delta:
+                        yield event.delta
+                        
         except Exception as e:
              yield f"Error: {str(e)}"
 
