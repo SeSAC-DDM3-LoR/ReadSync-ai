@@ -115,9 +115,9 @@ async def generate_response(request: GenerateRequest):
 
     messages = [{"role": "system", "content": system_prompt}]
     
-    # 이전 대화 내역 추가 (최근 6개 정도만)
+    # 이전 대화 내역 추가 (백엔드에서 이미 필터링해서 보내지만, 안전장치로 유지)
     if request.previous_messages:
-        messages.extend(request.previous_messages[-6:])
+        messages.extend(request.previous_messages[-10:])
         
     # 현재 컨텍스트 및 질문 추가
     user_content = request.user_msg
@@ -154,20 +154,20 @@ async def generate_response_stream(request: GenerateRequest):
     system_prompt = "You are a helpful AI reading assistant named 'ReadSync AI'. Answer in Korean."
 
     if request.chat_type == "DEFINITION":
-        system_prompt += " Explain the term clearly and concisely based on standard dictionary definitions."
+        system_prompt += " Explain the term clearly and concisely based on standard dictionary definitions. If the term has a specific meaning in the book's context provided, prioritize that."
     elif request.chat_type == "CONTENT_QA":
-        system_prompt += " Answer the question based ONLY on the provided Context."
+        system_prompt += " Answer the question based ONLY on the provided Context. If the answer is not in the Context, say '제공된 내용에서는 답을 찾을 수 없습니다.' Cite the source paragraph if possible."
     elif request.chat_type == "SUMMARY":
         system_prompt += " Summarize the provided text concisely."
     elif request.chat_type == "QUIZ":
-        system_prompt += " Generate a multiple-choice quiz."
+        system_prompt += " Generate a multiple-choice quiz based on the context. Provide the question, 4 options, and the answer."
     elif request.chat_type == "CHIT_CHAT":
-        system_prompt += " Engage in a friendly conversation."
+        system_prompt += " Engage in a friendly, polite conversation. Do not make up facts about the book if you don't know."
 
     messages = [{"role": "system", "content": system_prompt}]
     
     if request.previous_messages:
-        messages.extend(request.previous_messages[-6:])
+        messages.extend(request.previous_messages[-10:])
         
     user_content = request.user_msg
     if request.rag_context:
