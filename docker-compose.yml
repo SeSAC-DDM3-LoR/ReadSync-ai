@@ -7,4 +7,8 @@ services:
     env_file:
       - .env
     environment:
-      - PYTHONPATH=/app/src
+    - AWS_ACCESS_KEY=${AWS_ACCESS_KEY}         # .env 값을 가져옴
+    - AWS_SECRET_KEY=${AWS_SECRET_KEY}         # .env 값을 가져옴
+    - AWS_REGION=${AWS_REGION}
+    - AWS_BUCKET_NAME=${AWS_BUCKET_NAME}
+    - PYTHONPATH=/app/src

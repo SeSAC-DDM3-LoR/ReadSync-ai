@@ -59,10 +59,14 @@ import numpy as np
 import aioboto3
 from fastapi import APIRouter, HTTPException
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from pydantic import BaseModel
 from huggingface_hub import AsyncInferenceClient
 from dotenv import load_dotenv
+
+
+import re
+import requests
 
 # .env 로드 및 설정
 load_dotenv()
@@ -73,97 +77,11 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 client = AsyncInferenceClient(model=MODEL_ID, token=HF_TOKEN)
 
-class S3EmbeddingRequest(BaseModel):
-    s3_url: str
-
-class EmbeddingResponse(BaseModel):
-    embedding: List[float]
-
-@router.post("/embed-from-s3", response_model=EmbeddingResponse)
-async def get_embedding(request: S3EmbeddingRequest):
+# 1. Google Drive 다운로드 함수
+async def download_from_drive(google_drive_url: str):
     try:
-        # 1. S3 URL 파싱
-        parsed_url = urlparse(request.s3_url)
-        bucket_name = parsed_url.netloc.split('.')[0]
-        key = parsed_url.path.lstrip('/')
-
-        # 2. aioboto3를 이용한 비동기 파일 다운로드
-        session = aioboto3.Session()
-        async with session.client('s3') as s3:
-            # S3 오브젝트 메타데이터 가져오기
-            response = await s3.get_object(Bucket=bucket_name, Key=key)
-            
-            # 스트림 데이터 비동기 읽기
-            async with response['Body'] as stream:
-                file_content = await stream.read()
-                book_data = json.loads(file_content.decode('utf-8'))
-
-        # 3. 텍스트 추출 및 청크 분절
-        texts = [node['text'] for node in book_data.get('content', []) if 'text' in node]
-        # chunks: List[str] = []
-        embedding_list = [] # 임베딩된 벡터값들만 담을 리스트
-        current_chunk = ""
-        
-        for text in texts:
-            if len(current_chunk) + len(text) > TOKEN_LIMIT:
-                if current_chunk.strip():
-                    # [즉시 임베딩] 지금까지 모인 청크를 임베딩하여 벡터 저장
-                    vector = await client.feature_extraction(current_chunk.strip())
-                    embedding_list.append(vector)
-                    current_chunk = ""
-
-                # 1-2. [중요] 새로 들어온 text 자체가 limit보다 크다면? 
-                # 이 text를 limit 단위로 쪼개서 즉시 임베딩 리스트에 넣음
-                if len(text) > TOKEN_LIMIT:
-                    sub_chunks = [text[i : i + TOKEN_LIMIT] for i in range(0, len(text), TOKEN_LIMIT)]
-                    # 마지막 조각은 다음 text와 합치기 위해 남겨두고 나머지는 즉시 임베딩
-                    for sub in sub_chunks[:-1]:
-                        vector = await client.feature_extraction(sub.strip())
-                        embedding_list.append(vector)
-                    current_chunk = sub_chunks[-1] # 마지막 조각만 유지
-                else:
-                    current_chunk = text
-            else:
-                current_chunk += " " + text
-        
-        if current_chunk.strip():
-            vector = await client.feature_extraction(current_chunk.strip())
-            embedding_list.append(vector)
-            # chunks.append(current_chunk.strip())
-
-        # if not chunks:
-        if not embedding_list:
-            raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
-
-        # 4. 허깅페이스 API 호출 (비동기 배치 처리)
-        # vectors = await client.feature_extraction(chunks) # type: ignore
-        
-        # 산술 평균 계산: $$V_{integrated} = \frac{1}{n} \sum_{i=1}^{n} V_i$$
-        # integrated_vector = np.mean(vectors, axis=0)
-        integrated_vector = np.mean(embedding_list, axis=0)
-
-        print(f"총 임베딩된 청크 수: {len(embedding_list)}")
-        
-        # 5. 안전한 타입 변환 후 반환
-        result_list = integrated_vector.tolist() if hasattr(integrated_vector, "tolist") else integrated_vector
-        return {"embedding": result_list}
-
-    except Exception as e:
-        print(f"❌ S3 비동기 임베딩 처리 실패: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-import re
-import requests
-
-class DriveEmbeddingRequest(BaseModel):
-    google_drive_url: str
-
-@router.post("/embed-from-drive")
-async def get_embedding_from_drive(request: DriveEmbeddingRequest):
-    try:
-        # 1. 구글 드라이브 링크에서 파일 ID 추출
-        # 링크 형식: https://drive.google.com/file/d/FILE_ID/view?usp=sharing
-        file_id_match = re.search(r'/d/([^/]+)', request.google_drive_url)
+        # 파일 ID 추출
+        file_id_match = re.search(r'/d/([^/]+)', google_drive_url)
         if not file_id_match:
             raise HTTPException(status_code=400, detail="유효하지 않은 구글 드라이브 링크입니다.")
         
@@ -177,54 +95,169 @@ async def get_embedding_from_drive(request: DriveEmbeddingRequest):
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail="구글 드라이브 파일을 가져오지 못했습니다. 공유 설정을 확인하세요.")
             
-        book_data = response.json()
+        return response.json()
+    except Exception as e:
+        print(f"❌ Drive 다운로드 실패: {e}")
+        raise e
 
-        # 4. 텍스트 추출 및 청크 분절
-        texts = [node['text'] for node in book_data.get('content', []) if 'text' in node]
-        # chunks: List[str] = []
-        embedding_list = [] # 임베딩된 벡터값들만 담을 리스트
-        current_chunk = ""
+# 2. S3 다운로드 함수
+async def download_from_s3(s3_url: str):
+    # 🔍 1. 디버깅: 환경 변수가 제대로 들어왔는지 로그로 확인
+    ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
+    SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+    REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+    # BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "")
+    
+    if not ACCESS_KEY or not SECRET_KEY:
+        print("❌ AWS 자격 증명(환경 변수)이 없습니다! docker-compose.yml을 확인하세요.")
+    else:
+        print(f"🔑 AWS Key 로드 성공: {ACCESS_KEY[:4]}****")
+
+    try:
+        # 🔍 2. URL 파싱 로직 (s3:// 프로토콜과 https:// URL 모두 대응하도록 보완)
+        parsed_url = urlparse(s3_url)
         
-        for text in texts:
-            if len(current_chunk) + len(text) > TOKEN_LIMIT:
-                if current_chunk.strip():
-                    # [즉시 임베딩] 지금까지 모인 청크를 임베딩하여 벡터 저장
-                    vector = await client.feature_extraction(current_chunk.strip())
-                    embedding_list.append(vector)
-                    current_chunk = ""
+        # 's3://버킷명/키' 형식인 경우
+        if parsed_url.scheme == 's3':
+            bucket_name = parsed_url.netloc
+            key = unquote(parsed_url.path.lstrip('/'))
+        # 'https://버킷명.s3...' 형식인 경우
+        else:
+            bucket_name = parsed_url.netloc.split('.')[0]
+            key = unquote(parsed_url.path.lstrip('/'))
 
-                # 1-2. [중요] 새로 들어온 text 자체가 limit보다 크다면? 
-                # 이 text를 limit 단위로 쪼개서 즉시 임베딩 리스트에 넣음
-                if len(text) > TOKEN_LIMIT:
-                    sub_chunks = [text[i : i + TOKEN_LIMIT] for i in range(0, len(text), TOKEN_LIMIT)]
-                    # 마지막 조각은 다음 text와 합치기 위해 남겨두고 나머지는 즉시 임베딩
-                    for sub in sub_chunks[:-1]:
-                        vector = await client.feature_extraction(sub.strip())
-                        embedding_list.append(vector)
-                    current_chunk = sub_chunks[-1] # 마지막 조각만 유지
-                else:
-                    current_chunk = text
+        # 🔍 3. 세션 생성 시 명시적으로 자격 증명 주입 (가장 안전함)
+        session = aioboto3.Session(
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+            region_name=REGION
+        )
 
-            else:
-                current_chunk += " " + text
-        
-        if current_chunk.strip():
-            vector = await client.feature_extraction(current_chunk.strip())
-            embedding_list.append(vector)
-            # chunks.append(current_chunk.strip())
-
-        # if not chunks:
-        if not embedding_list:
-            raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
-
-        integrated_vector = np.mean(embedding_list, axis=0)
-
-        print(f"총 임베딩된 청크 수: {len(embedding_list)}")
-        
-        return {"embedding": integrated_vector.tolist()}
+        async with session.client('s3') as s3:
+            print(f"⬇️ 다운로드 시작: {bucket_name}/{key}")
+            response = await s3.get_object(Bucket=bucket_name, Key=key)
+            async with response['Body'] as stream:
+                file_content = await stream.read()
+                return json.loads(file_content.decode('utf-8'))
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"처리 중 오류 발생: {str(e)}")
+        print(f"❌ S3 다운로드 에러 상세: {str(e)}")
+        # 에러를 감추지 말고 호출한 쪽(FastAPI)에서 500 에러 원인을 알 수 있게 던짐
+        raise e
+
+def aggregate_vectors(vectors, p=1.05, use_softmax=True):
+    """
+    여러 벡터를 비선형 가중치(Power Pooling + Softmax)를 적용하여 하나의 벡터로 집계합니다.
+    p: 지수가 높을수록 '강한 특징'을 가진 벡터의 신호가 증폭됩니다.
+    """
+    if not vectors:
+        return None
+    
+    arr = np.array(vectors)
+    
+    # 1. 벡터별 가중치 계산 (Softmax Weighting)
+    if use_softmax:
+        # 벡터의 L2 Norm이 큰(정보량이 많은) 벡터에 더 높은 가중치 부여
+        norms = np.linalg.norm(arr, axis=1)
+        exp_norms = np.exp(norms - np.max(norms))
+        weights = exp_norms / np.sum(exp_norms)
+        # 가중치 적용
+        arr = arr * weights[:, np.newaxis]
+    
+    # 2. 원소별 신호 증폭 (Power Pooling)
+    # 부호 유지하며 p제곱 수행
+    signed_power = np.sign(arr) * (np.abs(arr) ** p)
+    
+    # 3. 합산 및 정규화
+    integrated_vec = np.sum(signed_power, axis=0)
+    
+    # 코사인 유사도 검색을 위한 L2 정규화
+    norm = np.linalg.norm(integrated_vec)
+    if norm > 1e-9:
+        integrated_vec = integrated_vec / norm
+        
+    return integrated_vec
+    
+async def core_embedding_logic(path: str):
+    if "drive.google.com" in path:
+        book_data = await download_from_drive(path)
+    elif "amazonaws.com" in path or ".s3." in path:
+        book_data = await download_from_s3(path)
+    else:
+        raise HTTPException(status_code=400, detail="지원하지 않는 파일 경로 형식입니다.")
+
+    texts = [node['text'] for node in book_data.get('content', []) if 'text' in node]
+        # chunks: List[str] = []
+    embedding_list = [] # 임베딩된 벡터값들만 담을 리스트
+    current_chunk = ""
+    
+    for text in texts:
+        if len(current_chunk) + len(text) > TOKEN_LIMIT:
+            if current_chunk.strip():
+                # [즉시 임베딩] 지금까지 모인 청크를 임베딩하여 벡터 저장
+                vector = await client.feature_extraction(current_chunk.strip())
+                embedding_list.append(vector)
+                current_chunk = ""
+
+            # 1-2. [중요] 새로 들어온 text 자체가 limit보다 크다면? 
+            # 이 text를 limit 단위로 쪼개서 즉시 임베딩 리스트에 넣음
+            if len(text) > TOKEN_LIMIT:
+                sub_chunks = [text[i : i + TOKEN_LIMIT] for i in range(0, len(text), TOKEN_LIMIT)]
+                # 마지막 조각은 다음 text와 합치기 위해 남겨두고 나머지는 즉시 임베딩
+                for sub in sub_chunks[:-1]:
+                    vector = await client.feature_extraction(sub.strip())
+                    embedding_list.append(vector)
+                current_chunk = sub_chunks[-1] # 마지막 조각만 유지
+            else:
+                current_chunk = text
+
+        else:
+            current_chunk += " " + text
+    
+    if current_chunk.strip():
+        vector = await client.feature_extraction(current_chunk.strip())
+        embedding_list.append(vector)
+        # chunks.append(current_chunk.strip())
+
+    # if not chunks:
+    if not embedding_list:
+        raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
+
+    # integrated_vector = np.mean(embedding_list, axis=0)
+    integrated_vector = aggregate_vectors(embedding_list)
+
+    result_list = integrated_vector.tolist() if hasattr(integrated_vector, "tolist") else integrated_vector
+
+    print(f"총 임베딩된 청크 수: {len(embedding_list)}")
+
+    return result_list
+
+class S3EmbeddingRequest(BaseModel):
+    s3_url: str
+
+class EmbeddingResponse(BaseModel):
+    embedding: List[float]
+
+@router.post("/embed-from-s3", response_model=EmbeddingResponse)
+async def get_embedding(request: S3EmbeddingRequest):
+    vector = await core_embedding_logic(request.s3_url)
+    return {"embedding": vector}
+
+    # except Exception as e:
+    #     print(f"❌ S3 비동기 임베딩 처리 실패: {e}")
+    #     raise HTTPException(status_code=500, detail=str(e))
+
+
+class DriveEmbeddingRequest(BaseModel):
+    google_drive_url: str
+
+@router.post("/embed-from-drive")
+async def get_embedding_from_drive(request: DriveEmbeddingRequest):
+    vector = await core_embedding_logic(request.google_drive_url)
+    return {"embedding": vector.tolist()}
+
+    # except Exception as e:
+    #     raise HTTPException(status_code=500, detail=f"처리 중 오류 발생: {str(e)}")
     
 
 @router.post("/text-from-drive")
@@ -258,6 +291,23 @@ async def get_text_from_drive(request: DriveEmbeddingRequest) -> List[str]:
 
     return texts
 
+class TextEmbeddingRequest(BaseModel):
+    text: str
+
+@router.post("/embed-text")
+async def get_embedding_from_text(request: TextEmbeddingRequest):
+    try:
+        # 허깅페이스 API 호출 (await 사용)
+        embedding = await client.feature_extraction(request.text)
+        
+        # 반환된 결과가 리스트 형태인지 확인 후 전달
+        # 보통 feature_extraction은 리스트나 넘파이 배열 형태를 반환합니다.
+        return {"embedding": embedding.tolist() if hasattr(embedding, "tolist") else embedding}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"HuggingFace API 오류: {str(e)}")
+
+class RagEmbeddingRequest(BaseModel):
+    content: List[dict] # 책의 content 구조 (text, id 포함)
 
 
 class RagNode(BaseModel):
@@ -414,3 +464,30 @@ async def embed_rag_content(request: RagEmbeddingRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- [새로 추가할 배치 엔드포인트] ---
+@router.post("/embed-batch")
+async def get_batch_embeddings(request: dict):
+    paths = request.get("paths", [])
+    chapter_vectors = []
+
+    # 자바가 보낸 경로 리스트를 순회하며 임베딩
+    for path in paths:
+        chapter_vec = await core_embedding_logic(path)
+        if chapter_vec is not None:
+            chapter_vectors.append(chapter_vec)
+
+    if not chapter_vectors:
+        raise HTTPException(status_code=400, detail="임베딩할 수 있는 데이터가 없습니다.")
+
+    # 북 벡터 계산 (모든 챕터 벡터의 평균)
+    # average_vector = np.mean(chapter_vectors, axis=0)
+    average_vector = aggregate_vectors(chapter_vectors, 1)
+
+    book_vector = average_vector.tolist() if hasattr(average_vector, "tolist") else average_vector
+
+    return {
+        "book_vector": book_vector,
+        "chapter_vectors": [cv.tolist() if hasattr(cv, "tolist") else cv for cv in chapter_vectors]
+    }
