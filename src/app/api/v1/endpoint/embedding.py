@@ -59,7 +59,7 @@ import numpy as np
 import aioboto3
 from fastapi import APIRouter, HTTPException
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from pydantic import BaseModel
 from huggingface_hub import AsyncInferenceClient
 from dotenv import load_dotenv
@@ -102,19 +102,47 @@ async def download_from_drive(google_drive_url: str):
 
 # 2. S3 다운로드 함수
 async def download_from_s3(s3_url: str):
-    try:
-        parsed_url = urlparse(s3_url)
-        bucket_name = parsed_url.netloc.split('.')[0]
-        key = parsed_url.path.lstrip('/')
+    # 🔍 1. 디버깅: 환경 변수가 제대로 들어왔는지 로그로 확인
+    ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
+    SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+    REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+    # BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "")
+    
+    if not ACCESS_KEY or not SECRET_KEY:
+        print("❌ AWS 자격 증명(환경 변수)이 없습니다! docker-compose.yml을 확인하세요.")
+    else:
+        print(f"🔑 AWS Key 로드 성공: {ACCESS_KEY[:4]}****")
 
-        session = aioboto3.Session()
+    try:
+        # 🔍 2. URL 파싱 로직 (s3:// 프로토콜과 https:// URL 모두 대응하도록 보완)
+        parsed_url = urlparse(s3_url)
+        
+        # 's3://버킷명/키' 형식인 경우
+        if parsed_url.scheme == 's3':
+            bucket_name = parsed_url.netloc
+            key = unquote(parsed_url.path.lstrip('/'))
+        # 'https://버킷명.s3...' 형식인 경우
+        else:
+            bucket_name = parsed_url.netloc.split('.')[0]
+            key = unquote(parsed_url.path.lstrip('/'))
+
+        # 🔍 3. 세션 생성 시 명시적으로 자격 증명 주입 (가장 안전함)
+        session = aioboto3.Session(
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+            region_name=REGION
+        )
+
         async with session.client('s3') as s3:
+            print(f"⬇️ 다운로드 시작: {bucket_name}/{key}")
             response = await s3.get_object(Bucket=bucket_name, Key=key)
             async with response['Body'] as stream:
                 file_content = await stream.read()
                 return json.loads(file_content.decode('utf-8'))
+
     except Exception as e:
-        print(f"❌ S3 다운로드 실패: {e}")
+        print(f"❌ S3 다운로드 에러 상세: {str(e)}")
+        # 에러를 감추지 말고 호출한 쪽(FastAPI)에서 500 에러 원인을 알 수 있게 던짐
         raise e
 
 def aggregate_vectors(vectors, p=1.05, use_softmax=True):
