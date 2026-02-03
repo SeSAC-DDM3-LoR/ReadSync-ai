@@ -155,6 +155,10 @@ async def classify_message(request: ClassifyRequest):
         
         chat_type = response.output_text.strip().upper()
         
+        # [LOGGING] LLM 결과 확인
+        print(f"\n[Classify Message] LLM Raw Output: {response.output_text}")
+        print(f"[Classify Message] Parsed Chat Type: {chat_type}\n")
+        
         # 유효성 검사 (혹시 모를 환각 방지)
         valid_types = ["DEFINITION", "CONTENT_QA", "CONTENT_QA_CONTEXT", "SUMMARY", "QUIZ", "CHIT_CHAT"]
         if chat_type not in valid_types:
@@ -213,6 +217,11 @@ async def rewrite_message(request: RewriteRequest):
         )
         
         rewritten_msg = response.output_text.strip()
+        
+        # [LOGGING] Rewrite 결과 확인
+        print(f"\n[Rewrite Message] Original: {request.user_msg}")
+        print(f"[Rewrite Message] Rewritten: {rewritten_msg}\n")
+        
         return RewriteResponse(rewritten_msg=rewritten_msg)
 
     except Exception as e:
@@ -243,6 +252,9 @@ async def generate_response(request: GenerateRequest):
 
     # Input 문자열 구성
     input_text = format_chat_history(request.previous_messages, request.user_msg, request.rag_context)
+
+    # [LOGGING] Generate Response Input 확인
+    print(f"\n[Generate Response] Input Text:\n{input_text}\n{'='*50}\n")
 
     try:
         # Chat Type에 따른 모델 및 파라미터 설정
@@ -300,6 +312,9 @@ async def generate_response_stream(request: GenerateRequest):
 
     # Input 문자열 구성
     input_text = format_chat_history(request.previous_messages, request.user_msg, request.rag_context)
+
+    # [LOGGING] Generate Response Stream Input 확인
+    print(f"\n[Generate Response Stream] Input Text:\n{input_text}\n{'='*50}\n")
 
     async def event_generator():
         try:
