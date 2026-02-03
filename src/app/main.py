@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.api.v1.endpoint.embedding import router as embedding_router
+from app.api.v1.endpoint.tts import router as soy_test_router
 
 # 로컬에서 가져오는 경우
 # from app.lifespan import lifespan, ml_models
@@ -24,3 +25,7 @@ async def root():
 #     return {"model_status": model_status}
 
 app.include_router(embedding_router, prefix="/api/v1", tags=["Embedding"])
+app.include_router(soy_test_router, prefix="/api/v1/soy-test", tags=["SoyTest"])
+
+from app.api.v1.endpoint.chat import router as chat_router
+app.include_router(chat_router, prefix="/api/v1", tags=["Chat"])

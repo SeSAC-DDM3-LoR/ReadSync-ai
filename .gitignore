@@ -101,3 +101,8 @@ postgres_data/
 docker-compose-*.yml
 poetry.lock
 pyproject.toml
+
+
+# soy test 
+src/app/domain/tts/test_resources/
+src/app/domain/soy_test/
