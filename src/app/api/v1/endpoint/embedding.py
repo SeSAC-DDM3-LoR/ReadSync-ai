@@ -57,6 +57,7 @@ import os
 import json
 import numpy as np
 import aioboto3
+import asyncio
 from fastapi import APIRouter, HTTPException
 from typing import List
 from urllib.parse import urlparse, unquote
@@ -71,11 +72,15 @@ import requests
 # .env 로드 및 설정
 load_dotenv()
 router = APIRouter()
-TOKEN_LIMIT = 3000 # 청크 분절 기준
+TOKEN_LIMIT = 2000 # 청크 분절 기준
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID")
 client = AsyncInferenceClient(model=MODEL_ID, token=HF_TOKEN)
+
+# [Global Limiter] 전체 애플리케이션 수준에서 동시 요청 수 제한
+# 함수 내부가 아닌 전역 변수로 선언해야 여러 책을 동시에 처리할 때도 총합을 제한할 수 있습니다.
+GLOBAL_SEMAPHORE = asyncio.Semaphore(20) # 5 -> 20으로 상향 (안정성 확인 필요)
 
 # 1. Google Drive 다운로드 함수
 async def download_from_drive(google_drive_url: str):
@@ -90,8 +95,10 @@ async def download_from_drive(google_drive_url: str):
         # 2. 직속 다운로드 URL 생성
         download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
         
-        # 3. 파일 다운로드
-        response = requests.get(download_url)
+        # 3. 파일 다운로드 (Non-blocking)
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, requests.get, download_url)
+        
         if response.status_code != 200:
             raise HTTPException(status_code=500, detail="구글 드라이브 파일을 가져오지 못했습니다. 공유 설정을 확인하세요.")
             
@@ -145,33 +152,44 @@ async def download_from_s3(s3_url: str):
         # 에러를 감추지 말고 호출한 쪽(FastAPI)에서 500 에러 원인을 알 수 있게 던짐
         raise e
 
-def aggregate_vectors(vectors, p=1.05, use_softmax=True):
+def aggregate_vectors(vectors):
     """
-    여러 벡터를 비선형 가중치(Power Pooling + Softmax)를 적용하여 하나의 벡터로 집계합니다.
-    p: 지수가 높을수록 '강한 특징'을 가진 벡터의 신호가 증폭됩니다.
+    여러 텍스트 청크의 벡터를 하나로 합칩니다.
+    [Hybrid Aggregation] Mean Pooling + Max Pooling
     """
     if not vectors:
         return None
     
+    
     arr = np.array(vectors)
     
-    # 1. 벡터별 가중치 계산 (Softmax Weighting)
-    if use_softmax:
-        # 벡터의 L2 Norm이 큰(정보량이 많은) 벡터에 더 높은 가중치 부여
-        norms = np.linalg.norm(arr, axis=1)
-        exp_norms = np.exp(norms - np.max(norms))
-        weights = exp_norms / np.sum(exp_norms)
-        # 가중치 적용
-        arr = arr * weights[:, np.newaxis]
-    
-    # 2. 원소별 신호 증폭 (Power Pooling)
-    # 부호 유지하며 p제곱 수행
-    signed_power = np.sign(arr) * (np.abs(arr) ** p)
-    
-    # 3. 합산 및 정규화
-    integrated_vec = np.sum(signed_power, axis=0)
-    
-    # 코사인 유사도 검색을 위한 L2 정규화
+    # [Main] Power Mean Aggregation (p=3)
+    # 산술 평균(p=1)과 Max Pooling(p=무한대)의 절충안.
+    # 각 차원별 값의 크기를 p제곱하여 평균을 냄으로써,
+    # 강하게 발현된 특징(Keyword/Theme)을 "적당히 강조"하고(Sharpening), 
+    # 너무 약한 신호(Noise)는 억제합니다.
+    try:
+        # 0. 사전 정규화 (필수)
+        # Power Mean을 쓰려면 각 벡터의 스케일이 맞춰져 있어야 합니다.
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        arr_normalized = arr / (norms + 1e-9)
+
+        # 1. Power Mean (p=2.5)
+        # p=3이 너무 튈 수 있다는 우려를 반영하여 2.5로 하향 조정.
+        # 여전히 특징은 잘 살리지만(Sharpening), 3.0보다는 부드럽고 안정적입니다.
+        p = 2.5
+        power_arr = np.sign(arr_normalized) * np.power(np.abs(arr_normalized), p)
+        mean_vec = np.mean(power_arr, axis=0)
+        
+        # 2. 다시 원래 스케일로 복원 (Inverse Power)
+        # integrated_vec = sign(mean) * |mean|^(1/p)
+        integrated_vec = np.sign(mean_vec) * np.power(np.abs(mean_vec), 1.0/p)
+        
+    except Exception as e:
+        print(f"⚠️ Aggregation Failed, using simple mean: {e}")
+        integrated_vec = np.mean(arr, axis=0)
+
+    # 최종 정규화 (L2 Norm)
     norm = np.linalg.norm(integrated_vec)
     if norm > 1e-9:
         integrated_vec = integrated_vec / norm
@@ -187,26 +205,24 @@ async def core_embedding_logic(path: str):
         raise HTTPException(status_code=400, detail="지원하지 않는 파일 경로 형식입니다.")
 
     texts = [node['text'] for node in book_data.get('content', []) if 'text' in node]
-        # chunks: List[str] = []
-    embedding_list = [] # 임베딩된 벡터값들만 담을 리스트
+    
+    # 1. 먼저 텍스트를 청크로 모두 분할 (메모리 작업)
+    chunks_to_embed = []
     current_chunk = ""
     
     for text in texts:
         if len(current_chunk) + len(text) > TOKEN_LIMIT:
             if current_chunk.strip():
-                # [즉시 임베딩] 지금까지 모인 청크를 임베딩하여 벡터 저장
-                vector = await client.feature_extraction(current_chunk.strip())
-                embedding_list.append(vector)
+                chunks_to_embed.append(current_chunk.strip())
                 current_chunk = ""
 
             # 1-2. [중요] 새로 들어온 text 자체가 limit보다 크다면? 
-            # 이 text를 limit 단위로 쪼개서 즉시 임베딩 리스트에 넣음
             if len(text) > TOKEN_LIMIT:
                 sub_chunks = [text[i : i + TOKEN_LIMIT] for i in range(0, len(text), TOKEN_LIMIT)]
-                # 마지막 조각은 다음 text와 합치기 위해 남겨두고 나머지는 즉시 임베딩
+                # 마지막 조각은 다음 text와 합치기 위해 남겨두고 나머지는 즉시 리스트에 추가
                 for sub in sub_chunks[:-1]:
-                    vector = await client.feature_extraction(sub.strip())
-                    embedding_list.append(vector)
+                    if sub.strip():
+                        chunks_to_embed.append(sub.strip())
                 current_chunk = sub_chunks[-1] # 마지막 조각만 유지
             else:
                 current_chunk = text
@@ -214,10 +230,46 @@ async def core_embedding_logic(path: str):
         else:
             current_chunk += " " + text
     
+    # 마지막 남은 청크 처리
     if current_chunk.strip():
-        vector = await client.feature_extraction(current_chunk.strip())
-        embedding_list.append(vector)
-        # chunks.append(current_chunk.strip())
+        chunks_to_embed.append(current_chunk.strip())
+
+    if not chunks_to_embed:
+        raise HTTPException(status_code=400, detail="임베딩할 텍스트 내용이 없습니다.")
+
+    # 2. [병렬 처리] 모아둔 청크를 한꺼번에 임베딩 요청
+    # 기존: asyncio.gather로 무제한 요청 -> 504 Gateway Timeout 발생
+    # 변경: Global Semaphore로 전체 동시 요청 수 제한 + Retry 로직 적용
+
+    async def safe_embedding_request(text_chunk):
+        async with GLOBAL_SEMAPHORE:
+            max_retries = 5 # 재시도 횟수 증가
+            base_delay = 0.5 # 초기 대기 시간 단축 (2s -> 0.5s)
+            
+            for attempt in range(max_retries):
+                try:
+                    return await client.feature_extraction(text_chunk)
+                except Exception as e:
+                    # 504(Gateway Timeout), 502(Bad Gateway), 429(Too Many Requests) 등은 재시도 가치 있음
+                    error_msg = str(e)
+                    if "504" in error_msg or "502" in error_msg or "429" in error_msg:
+                        if attempt < max_retries - 1:
+                            # Exponential Backoff with Jitter (Optional)
+                            wait_time = base_delay * (2 ** attempt) 
+                            # print(f"⚠️ API Error ({e}), retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                            continue
+                    
+                    # 재시도 불가능한 에러이거나 횟수 초과 시
+                    print(f"❌ Feature Extraction Failed after {attempt+1} attempts: {e}")
+                    raise e
+
+    try:
+        tasks = [safe_embedding_request(chunk) for chunk in chunks_to_embed]
+        embedding_list = await asyncio.gather(*tasks)
+    except Exception as e:
+        print(f"❌ Parallel Embedding Error: {e}")
+        raise e
 
     # if not chunks:
     if not embedding_list:
@@ -273,8 +325,10 @@ async def get_text_from_drive(request: DriveEmbeddingRequest) -> List[str]:
     # 2. 직속 다운로드 URL 생성
     download_url = f'https://drive.google.com/uc?export=download&id={file_id}'
     
-    # 3. 파일 다운로드
-    response = requests.get(download_url)
+    # 3. 파일 다운로드 (Non-blocking)
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, requests.get, download_url)
+
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="구글 드라이브 파일을 가져오지 못했습니다. 공유 설정을 확인하세요.")
         
@@ -467,23 +521,37 @@ async def embed_rag_content(request: RagEmbeddingRequest):
 
 
 # --- [새로 추가할 배치 엔드포인트] ---
+import asyncio
+
+# --- [새로 추가할 배치 엔드포인트] ---
 @router.post("/embed-batch")
 async def get_batch_embeddings(request: dict):
     paths = request.get("paths", [])
     chapter_vectors = []
 
-    # 자바가 보낸 경로 리스트를 순회하며 임베딩
-    for path in paths:
-        chapter_vec = await core_embedding_logic(path)
-        if chapter_vec is not None:
-            chapter_vectors.append(chapter_vec)
+    # [수정] asyncio.gather를 사용하여 병렬 처리
+    # 기존: 순차적 await -> 느림
+    # 변경: 동시에 여러 요청 처리 -> 빠름
+    
+    # 1. 태스크 생성
+    tasks = [core_embedding_logic(path) for path in paths]
+    
+    # 2. 병렬 실행
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 3. 결과 수집 (에러가 난 항목은 제외하거나 로깅)
+    for res in results:
+        if isinstance(res, Exception):
+            print(f"⚠️ Batch processing error: {res}")
+        elif res is not None:
+            chapter_vectors.append(res)
 
     if not chapter_vectors:
         raise HTTPException(status_code=400, detail="임베딩할 수 있는 데이터가 없습니다.")
 
     # 북 벡터 계산 (모든 챕터 벡터의 평균)
     # average_vector = np.mean(chapter_vectors, axis=0)
-    average_vector = aggregate_vectors(chapter_vectors, 1)
+    average_vector = aggregate_vectors(chapter_vectors)
 
     book_vector = average_vector.tolist() if hasattr(average_vector, "tolist") else average_vector
 

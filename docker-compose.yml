@@ -18,6 +18,12 @@ services:
       - AWS_SECRET_KEY=${AWS_SECRET_KEY}         # .env 값을 가져옴
       - AWS_REGION=${AWS_REGION}
       - AWS_BUCKET_NAME=${AWS_BUCKET_NAME}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LUXIA_API_KEY=${LUXIA_API_KEY}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+
     # 개발 모드: 코드가 수정되면 서버가 자동으로 재시작되도록 --reload 옵션을 추가합니다.
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
