@@ -99,3 +99,9 @@ db/
 redis/
 postgres_data/
 docker-compose-*.yml
+
+
+# soy test 
+src/app/domain/tts/test_resources/
+src/app/domain/soy_test/
+

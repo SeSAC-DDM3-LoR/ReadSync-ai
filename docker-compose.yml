@@ -1,14 +1,25 @@
+version: '3.8'
+
 services:
   ai-server:
     build: .
     container_name: readsync-ai-container
     ports:
       - "8000:8000"
+    volumes:
+      # 전체 폴더(.:/app) 대신 소스 코드 폴더만 연결합니다.
+      # 이렇게 하면 로컬에서 코드를 수정했을 때 컨테이너에 바로 반영됩니다.
+      - ./src:/app/src
     env_file:
       - .env
     environment:
-    - AWS_ACCESS_KEY=${AWS_ACCESS_KEY}         # .env 값을 가져옴
-    - AWS_SECRET_KEY=${AWS_SECRET_KEY}         # .env 값을 가져옴
-    - AWS_REGION=${AWS_REGION}
-    - AWS_BUCKET_NAME=${AWS_BUCKET_NAME}
-    - PYTHONPATH=/app/src
+      - PYTHONPATH=/app/src
+      - AWS_ACCESS_KEY=${AWS_ACCESS_KEY}         # .env 값을 가져옴
+      - AWS_SECRET_KEY=${AWS_SECRET_KEY}         # .env 값을 가져옴
+      - AWS_REGION=${AWS_REGION}
+      - AWS_BUCKET_NAME=${AWS_BUCKET_NAME}
+    # 개발 모드: 코드가 수정되면 서버가 자동으로 재시작되도록 --reload 옵션을 추가합니다.
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+      
+      
