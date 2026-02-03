@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from app.api.v1.endpoint.embedding import router as embedding_router
 from app.api.v1.endpoint.tts import router as soy_test_router
+from app.api.v1.endpoint.chat import router as chat_router
+
 
 # 로컬에서 가져오는 경우
 # from app.lifespan import lifespan, ml_models
