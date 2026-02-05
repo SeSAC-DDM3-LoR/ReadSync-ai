@@ -350,3 +350,4 @@ async def generate_response_stream(request: GenerateRequest):
              yield f"Error: {str(e)}"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
