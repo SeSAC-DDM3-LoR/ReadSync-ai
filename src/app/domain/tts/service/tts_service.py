@@ -20,12 +20,21 @@ class TtsService:
         # 데모용: 실제로는 DB에서 가져와야 할 텍스트 데이터를 파일에서 로드한다고 가정
         self.json_path = "src/app/domain/tts/test_resources/book/만세전_chapter4.json"
 
-    async def get_audio_url(self, paragraph_id: str, chapter_id: str = "ch4") -> str:
+    async def get_audio_url(self, paragraph_id: str, chapter_id: str = "ch4", voice_id: int = 76) -> str:
         """
         프론트엔드 요청을 처리하는 메인 함수
+        
+        Args:
+            paragraph_id: 문단 ID (예: p_0001)
+            chapter_id: 챕터 ID (예: ch4)
+            voice_id: Luxia Voice ID (기본값: 76 - SEONBI)
+        
+        Returns:
+            S3 Presigned URL
         """
-        # S3 키 생성 (경로 구조: book/chapter/paragraph.wav)
-        s3_key = f"books/만세전/{chapter_id}/{paragraph_id}.wav"
+        # S3 키 생성 (경로 구조: books/만세전/chapter/voice_id/paragraph.wav)
+        # voice_id를 포함하여 같은 paragraph라도 다른 voice면 다른 파일로 저장
+        s3_key = f"books/만세전/{chapter_id}/voice_{voice_id}/{paragraph_id}.wav"
 
         # 1. S3에 파일이 있는지 확인
         if self._check_s3_exists(s3_key):
@@ -37,9 +46,9 @@ class TtsService:
         if not text:
             raise ValueError("해당 ID의 텍스트를 찾을 수 없습니다.")
 
-        # 3. Luxia API로 오디오 생성
-        print(f"Cache Miss. Luxia API 호출 중...: {paragraph_id}")
-        audio_data = await self._call_luxia_tts(text)
+        # 3. Luxia API로 오디오 생성 (voice_id 전달)
+        print(f"Cache Miss. Luxia API 호출 중... paragraph: {paragraph_id}, voice: {voice_id}")
+        audio_data = await self._call_luxia_tts(text, voice_id)
 
         if not audio_data:
             raise Exception("TTS 생성 실패")
@@ -71,17 +80,27 @@ class TtsService:
             ExpiresIn=3600
         )
 
-    async def _call_luxia_tts(self, text: str) -> bytes:
-        """Luxia API 호출 (이전 코드 재사용)"""
+    async def _call_luxia_tts(self, text: str, voice_id: int = 76) -> bytes:
+        """
+        Luxia API 호출
+        
+        Args:
+            text: TTS로 변환할 텍스트
+            voice_id: Luxia Voice ID (기본값: 76 - SEONBI)
+        
+        Returns:
+            오디오 데이터 (bytes)
+        """
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
                     "https://bridge.luxiacloud.com/luxia/v1/text-to-speech",
                     headers={"apikey": self.luxia_api_key, "Content-Type": "application/json"},
-                    json={"input": text, "voice": 76, "lang": "ko"},
+                    json={"input": text, "voice": voice_id, "lang": "ko"},
                     timeout=30.0
                 )
                 response.raise_for_status()
+                print(f"Luxia TTS 성공: text length={len(text)}, voice={voice_id}")
                 return response.content
             except Exception as e:
                 print(f"TTS API Error: {e}")
