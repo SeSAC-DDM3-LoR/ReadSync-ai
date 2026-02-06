@@ -1,0 +1,38 @@
+name: ReadSync AI CI/CD
+
+# main 브랜치에 push될 때 실행
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: 'ap-northeast-2'
+  EB_APPLICATION_NAME: 'readsync-ai'  # EB 애플리케이션 이름 (백엔드와 다름!)
+  EB_ENVIRONMENT_NAME: 'Readsync-ai-env' # EB 환경 이름
+
+jobs:
+  deploy:
+    name: Deploy to Elastic Beanstalk
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 소스 코드 압축 (Docker 배포 방식)
+      - name: Generate deployment package
+        run: |
+          zip -r deploy.zip . -x "*.git*" "*.github*" "test/*"
+
+      # Elastic Beanstalk 배포
+      - name: Deploy to Elastic Beanstalk
+        uses: einaregilsson/beanstalk-deploy@v21
+        with:
+          aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          application_name: ${{ env.EB_APPLICATION_NAME }}
+          environment_name: ${{ env.EB_ENVIRONMENT_NAME }}
+          version_label: v${{ github.run_number }}-${{ github.sha }}
+          region: ${{ env.AWS_REGION }}
+          deployment_package: deploy.zip
+          wait_for_deployment: true
